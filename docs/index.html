@@ -231,7 +231,7 @@
         <div class="section-intro">
           <p class="kicker">Install</p>
           <h2>Start with the MCP path that fits your client.</h2>
-          <p>The default route includes the server, agent skills, and guided setup. Direct package and container options are here when you want to configure things yourself. You can also hand the <a href="https://github.com/sirkirby/unifi-mcp/blob/main/docs/agent-install.md">agent installation guide</a> to your coding agent.</p>
+          <p>The default route includes the server, agent skills, and guided setup. Direct package and container options are here when you want to configure things yourself. You can also hand the <a href="https://github.com/sirkirby/unifi-mcp/blob/main/docs/agent-install.md">agent installation guide</a> to your coding agent. Already using the plugins? Read the <a href="https://github.com/sirkirby/unifi-mcp/blob/main/docs/plugin-upgrade.md">plugin upgrade guide</a> before updating.</p>
         </div>
         <div class="install-card">
           <div class="install-tabs" role="tablist" aria-label="MCP installation methods">
@@ -254,11 +254,12 @@
           </div>
           <div role="tabpanel" id="panel-openclaw" aria-labelledby="tab-openclaw" class="install-panel" data-install-panel="openclaw" hidden>
             <button type="button" class="copy-button" data-copy>Copy</button>
-<pre><code>openclaw plugins install <span class="value">unifi-network</span> --marketplace <span class="value">https://github.com/sirkirby/unifi-mcp</span>
+<pre><code><span class="comment"># Confirms the source and capabilities; without a terminal add --force --accept-capabilities</span>
+openclaw plugins install <span class="value">unifi-network</span> --marketplace <span class="value">https://github.com/sirkirby/unifi-mcp</span>
 openclaw gateway restart
 
-<span class="comment"># Use the setup skill, or register the MCP server directly</span>
-openclaw mcp set <span class="value">unifi-network</span> <span class="value">'{"command":"uvx","args":["unifi-network-mcp@latest"]}'</span></code></pre>
+<span class="comment"># Run its setup skill; it saves the settings the plugin's own server reads</span>
+<span class="command">unifi-network-setup</span></code></pre>
           </div>
           <div role="tabpanel" id="panel-uvx" aria-labelledby="tab-uvx" class="install-panel" data-install-panel="uvx" hidden>
             <button type="button" class="copy-button" data-copy>Copy</button>

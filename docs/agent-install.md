@@ -1,6 +1,6 @@
 # Install UniFi MCP with an agent
 
-Last reviewed: 2026-09-19
+Last reviewed: 2026-10-11
 
 This guide is written for both people and coding agents. It separates three
 things that are easy to confuse:
@@ -43,7 +43,9 @@ During setup:
   because those take precedence over server-level gates. Unless the user
   separately requests write access, set the server's `CREATE`, `UPDATE`, and
   `DELETE` gates to `false`; then add back only the category/action overrides
-  the user selected.
+  the user selected. Claude Code plugin options hold only the server-level
+  gates: per-category overrides are not available there, and setup refuses
+  them.
 - Do not disable TLS verification without explaining the tradeoff. Many local
   UniFi consoles use a self-signed certificate, but a trusted certificate is
   preferred.
@@ -78,6 +80,10 @@ configuration paths remain during migration.
 
 ## Native plugin marketplaces
 
+See the [plugin support matrix](plugin-support.md) for prerequisites, version
+boundaries and which client combinations have real install evidence. To update
+an existing plugin install, follow the [plugin upgrade guide](plugin-upgrade.md).
+
 ### Claude Code
 
 In Claude Code:
@@ -89,12 +95,28 @@ In Claude Code:
 ```
 
 Replace `unifi-network` with `unifi-protect` or `unifi-access` as needed.
+`/plugin install` opens the plugin's options dialog straight away. Fill it in
+there, or press Esc and run the setup skill, which asks for each setting and
+never needs a password or API key typed into the chat. From a shell,
+`claude plugin install` instead reports the options as not yet set and suggests
+`--config KEY=VALUE`; those keys are the option names (`host`, `username`,
+`password_file`, `registration_mode` and so on), not the `UNIFI_*` variables.
+Pass only non-secret options that way, since command arguments reach your shell
+history; the setup skill saves the same options and validates them first.
+
 The setup skill checks prerequisites and guides credential and permission
-configuration.
+configuration, then saves the plugin's Claude Code options with
+`claude plugin configure`. Options apply in every project; a raw password or
+API key entered as an option is stored in the system keychain. Earlier plugin
+versions wrote the project's `.claude/settings.local.json` instead; the setup
+skill's migration moves those settings into the options. Because options apply
+in every project, a second project's migration refuses to replace a different
+saved host, username, port or site unless the user chooses `--replace`; see the
+[plugin upgrade guide](plugin-upgrade.md#claude-code).
 
 Rollback: use Claude Code's `/plugin` interface to uninstall only the UniFi
-plugin that was added, then remove the matching UniFi values from the project
-configuration if the user no longer needs them.
+plugin that was added. Remove leftover `UNIFI_*` values from an older project's
+`.claude/settings.local.json` if no other consumer needs them.
 
 ### Codex
 
@@ -110,9 +132,13 @@ Open Codex, run `/plugins`, install the chosen UniFi product, then ask:
 Use the unifi-network-setup skill to configure this for Codex.
 ```
 
-The setup skill registers the server through `codex mcp add`. Restart Codex
-after configuration. Roll back by uninstalling the selected plugin and removing
-only its matching MCP entry with the current `codex mcp` command.
+Setup saves your settings in `~/.config/unifi-mcp/<product>.env`, readable by you
+only, and the plugin's own server reads that file. Restart Codex after
+configuration. Codex installs plugin upgrades itself at the start of a session,
+and the plugin's server comes with them, so nothing needs rerunning. If you ran
+Codex setup before plugin 1.0.0, run its one-time `--refresh` (see the
+[plugin upgrade guide](plugin-upgrade.md#one-time-step-if-you-ran-codex-setup-before-100)).
+Roll back by uninstalling the selected plugin and deleting its settings file.
 
 ### GitHub Copilot CLI
 
@@ -136,8 +162,15 @@ openclaw plugins install unifi-network \
 openclaw gateway restart
 ```
 
-Run the matching setup skill after restart. Repeat only for other UniFi
-products the user selected.
+Without a terminal, as when an agent runs it, OpenClaw refuses the install
+until it gets `--force` (confirming a source outside ClawHub) and
+`--accept-capabilities`; ask the user before adding them. Run the matching setup
+skill after restart. Setup saves the settings in a private per-user file that the
+plugin's own server reads and writes no `openclaw.json` entry, so a later
+`openclaw plugins update` brings the new server with nothing to rerun. A session
+that is already open keeps the unconfigured server until a new session starts or
+`openclaw gateway restart` runs. Repeat only for other UniFi products the user
+selected.
 
 ## Standalone skills through npm
 
