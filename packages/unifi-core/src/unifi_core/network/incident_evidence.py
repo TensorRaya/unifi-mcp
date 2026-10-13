@@ -43,6 +43,7 @@ from unifi_core.incident_evidence import (
     format_utc,
     records_from_tool_response,
     source_failed,
+    window_from_epoch_ms,
 )
 from unifi_core.mac import looks_like_mac
 from unifi_core.network.models.events import identifier_message, threat_event_log_from_controller
@@ -219,6 +220,8 @@ def network_events_context(
     event_type: str | None = None,
     categories: Sequence[str] | None = None,
     severities: Sequence[str] | None = None,
+    device_macs: Sequence[str] | None = None,
+    window_ms: tuple[int, int] | None = None,
     api_path: ApiPath | None = None,
     page: SourcePage | None = None,
     source_id: str = "network.events",
@@ -240,8 +243,22 @@ def network_events_context(
     page does not record submitted bounds (the legacy path asks the
     controller for a relative lookback). ``start`` is an offset, so any value
     but 0 leaves the skipped prefix uncollected.
+
+    ``device_macs`` records an exact-MAC filter applied to the page's rows
+    after they were read; such a page must say ``post_filtered``.
+
+    ``window_ms`` describes a v2 read sent with absolute epoch-millisecond
+    ``timestampFrom``/``timestampTo`` bounds instead of a lookback: the query
+    records those bounds in place of ``within_hours``, and they are the
+    queried window.
     """
     api_path = _page_api_path(page, api_path)
+    if window_ms is not None:
+        lookback: dict[str, Any] = {"timestamp_from_ms": window_ms[0], "timestamp_to_ms": window_ms[1]}
+        queried = window_from_epoch_ms(*window_ms)
+    else:
+        lookback = {"within_hours": within_hours}
+        queried = _guaranteed_window(timedelta(hours=within_hours), request_started_at, collected_at)
     context = SourceContext(
         source_id=source_id,
         product=Product.NETWORK,
@@ -250,7 +267,7 @@ def network_events_context(
         endpoint=endpoint or (_EVENT_ENDPOINTS[api_path] if api_path else None),
         scope=_scope(site, controller_id, location_id),
         query={
-            "within_hours": within_hours,
+            **lookback,
             "limit": limit,
             "start": start,
             "event_type": event_type,
@@ -263,12 +280,13 @@ def network_events_context(
                 ("event_type", event_type),
                 ("categories", list(categories) if categories else None),
                 ("severities", list(severities) if severities else None),
+                ("device_macs", list(device_macs) if device_macs else None),
             )
             if value is not None
         },
         collected_at=format_utc(collected_at),
         requested_window=requested_window,
-        queried_window=_guaranteed_window(timedelta(hours=within_hours), request_started_at, collected_at),
+        queried_window=queried,
         offset=start,
         requested_cap=max(limit, 0),
         cap=effective_events_cap(limit, api_path),

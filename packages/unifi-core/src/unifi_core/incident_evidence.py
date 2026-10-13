@@ -18,6 +18,9 @@ Contract rules encoded here (see ``docs/incident-evidence.md``):
 - A source's retrieved count is a population total only when its coverage is
   complete. Total failure is ``failed``, never ``empty``; incomplete evidence
   is never ``coverage_complete``.
+- Retention is never claimed: neither product reports its oldest retained
+  event, so every source's ``retention_coverage`` is ``unknown`` and an empty
+  result is no proof that nothing happened before the controller discarded it.
 - Records are ordered by UTC time, then product, source, source record ID and
   evidence ID; records without a usable time sort last.
 """
@@ -233,6 +236,17 @@ class Truncation(str, Enum):
 class WindowCoverage(str, Enum):
     COVERED = "covered"
     NOT_COVERED = "not_covered"
+    UNKNOWN = "unknown"
+
+
+class RetentionCoverage(str, Enum):
+    """Whether the controller still held every event of the queried window.
+
+    Neither product reports its oldest retained event, so this is always
+    ``unknown``: an empty source means no event was returned, not that none
+    occurred before the controller discarded it.
+    """
+
     UNKNOWN = "unknown"
 
 
@@ -1022,6 +1036,54 @@ def fields_identity(source_id: str, digest: str) -> str:
     return f"{source_id}|fields|{digest}"
 
 
+def _digest_number(value: int | float) -> str:
+    """RFC 8785 number serialization, using the ECMAScript binary64 domain.
+
+    Python's shortest-round-trip digits need ECMAScript's fixed/exponential
+    thresholds and exponent spelling. Integers enter the same binary64 domain
+    as JSON.parse in JavaScript; use strings when exact larger integers matter.
+    """
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError("Evidence number exceeds the binary64 domain") from None
+    if not math.isfinite(number):
+        raise ValueError("Evidence numbers must be finite")
+    if number == 0:
+        return "0"
+    sign = "-" if number < 0 else ""
+    parts = Decimal(repr(abs(number))).as_tuple()
+    digits = "".join(str(digit) for digit in parts.digits)
+    exponent = int(parts.exponent)
+    while digits.endswith("0"):
+        digits = digits[:-1]
+        exponent += 1
+    point = len(digits) + exponent
+    if 0 < point <= 21:
+        text = digits[:point] + "." + digits[point:] if point < len(digits) else digits + "0" * (point - len(digits))
+    elif -6 < point <= 0:
+        text = "0." + "0" * -point + digits
+    else:
+        mantissa = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
+        text = mantissa + "e" + ("+" if point > 0 else "") + str(point - 1)
+    return sign + text
+
+
+def _digest_json(value: Any) -> str:
+    """Keep the digest's ASCII escaping/key order; canonicalize numbers only."""
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ",".join(json.dumps(key, ensure_ascii=True) + ":" + _digest_json(value[key]) for key in sorted(value))
+            + "}"
+        )
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_digest_json(item) for item in value) + "]"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _digest_number(value)
+    return json.dumps(value, ensure_ascii=True, allow_nan=False)
+
+
 def evidence_digest(
     *,
     source_record_id: str | int | None,
@@ -1037,6 +1099,8 @@ def evidence_digest(
     Fields the normalizers exclude (secrets, buffer stamps, recognized identity,
     display names) therefore cannot change identity or create conflicts. The
     time contributes only what the source returned, not window-derived state.
+    Numbers use RFC 8785 / ECMAScript serialization; all other input encoding
+    (ASCII string escapes, code-point key order and type tags) stays unchanged.
     """
     payload = {
         "source_record_id": None
@@ -1049,7 +1113,7 @@ def evidence_digest(
         "entities": [entity.model_dump(mode="json") for entity in entities],
         "attributes": {key: list(value) if isinstance(value, tuple) else value for key, value in attributes.items()},
     }
-    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    text = _digest_json(payload)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
 
 
@@ -1225,6 +1289,7 @@ class Coverage(_ClosedModel):
     filters: dict[str, QueryValue] = Field(json_schema_extra=_KEY_NAMES_SCHEMA)
     pagination: Pagination
     truncation: Truncation
+    retention_coverage: RetentionCoverage
     counts: RecordCounts
     complete: bool
     population_total: int | None = Field(ge=0)
@@ -1402,11 +1467,12 @@ class Budgets(_ClosedModel):
             BudgetKind.CALLS: (self.usage.calls, self.limits.calls),
             BudgetKind.ELAPSED: (self.usage.elapsed_ms, self.limits.elapsed_ms),
         }
+        # Exhaustion reported below the limit is allowed: a combined set sums
+        # limits and usage, and keeps a kind that stopped any one collection.
+        # Over-reporting can only make evidence less complete, never an all-clear.
         for kind, (used, limit) in pairs.items():
             if used > limit and kind not in self.exhausted:
                 raise ValueError(f"{kind.value} budget overran its limit and must be reported exhausted")
-            if kind in self.exhausted and used < limit:
-                raise ValueError(f"{kind.value} budget is reported exhausted below its limit")
         return self
 
 
@@ -1812,6 +1878,7 @@ def _coverage(
         filters=context.filters,
         pagination=pagination,
         truncation=truncation,
+        retention_coverage=RetentionCoverage.UNKNOWN,
         counts=counts,
         complete=complete,
         population_total=counts.in_window if complete else None,

@@ -15,10 +15,13 @@ from typing import Any, Callable
 
 from uiprotect.data import Event, EventType, ModelType, SmartDetectObjectType, WSAction, WSSubscriptionMessage
 
-from unifi_core.exceptions import UniFiNotFoundError
+from unifi_core.exceptions import UniFiConnectionError, UniFiMalformedResponseError, UniFiNotFoundError
+from unifi_core.protect.errors import safe_protect_error
 from unifi_core.protect.models.detection_search import from_controller as detection_search_from_controller
 from unifi_core.protect.models.events import smart_detection_from_controller
+from unifi_core.request_budget import RequestBudgetSpent, charged_request_middleware
 from unifi_core.source_page import SourcePage
+from unifi_core.support_transport import no_retry_support_request
 
 logger = logging.getLogger(__name__)
 
@@ -782,6 +785,76 @@ class EventManager:
         # uiprotect drops unknown, non-device and low-score events after the NVR
         # applied the limit, so how many rows the NVR returned is unknown.
         return _page(results, raw_count=None, limit=limit, start=start, end=end, post_filtered=True)
+
+    async def list_events_raw_page(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int,
+        offset: int = 0,
+        camera_id: str | None = None,
+    ) -> SourcePage:
+        """One bounded read of raw NVR event rows, for incident evidence.
+
+        One GET to the private ``events`` endpoint with explicit bounds, limit
+        and offset, newest first. Every attempt uiprotect makes for it (status
+        retries, the retry after a re-login) passes the request-local charge. Unlike :meth:`list_events_page`
+        it never uses the SDK's ``get_events``, which pages through every event
+        after ``start`` when no type filter is given and drops event types it
+        does not know. Rows are returned exactly as the NVR sent them, with no
+        camera-name or Known Face enrichment. Failures are raised with fixed
+        text that keeps the error class and HTTP status.
+        """
+        start_ms = int(start.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+        offset = max(offset, 0)
+        if limit <= 0:
+            return SourcePage(rows=[], offset=offset, cap=0, submitted_window_ms=(start_ms, end_ms))
+        params: dict[str, Any] = {
+            "orderDirection": "DESC",
+            "limit": limit,
+            "offset": offset,
+            "withoutDescriptions": "true",
+            "start": start_ms,
+            "end": end_ms,
+        }
+        if camera_id:
+            params["cameras"] = [camera_id]
+        try:
+            client = self._cm.client
+        except UniFiConnectionError:
+            # Join the manager's shared connect attempt, within its bound and this
+            # read's deadline. The attempt runs in its own task, so its login and
+            # bootstrap are never charged to this read; a connection still missing
+            # raises the manager's classified, fixed-text error.
+            await self._cm.ensure_connected()
+            client = self._cm.client
+        try:
+            # Request-local: each attempt (uiprotect's status and reconnect retries
+            # included) is charged to a bounded read, and aiohttp's own idempotent
+            # retry is suppressed, so no attempt goes uncounted.
+            rows = await client.api_request(
+                "events",
+                method="get",
+                params=params,
+                middlewares=(charged_request_middleware, no_retry_support_request),
+            )
+        except RequestBudgetSpent:
+            raise
+        except Exception as exc:
+            logger.error("[event-mgr] Raw events read failed: %s", type(exc).__name__)
+            raise safe_protect_error("Protect events read", exc) from None
+        if not isinstance(rows, list):
+            raise UniFiMalformedResponseError("Unexpected response shape from events")
+        return SourcePage(
+            rows=rows,
+            # A page shorter than the limit sent is the NVR saying it ran out.
+            has_more=False if len(rows) < limit else None,
+            offset=offset,
+            cap=limit,
+            submitted_window_ms=(start_ms, end_ms),
+        )
 
     async def get_event(
         self,

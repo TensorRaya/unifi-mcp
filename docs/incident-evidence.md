@@ -15,6 +15,10 @@ none of them define their own evidence semantics.
 | Golden corpus | `tests/fixtures/incident_evidence/cases/*.json` |
 | Invalid corpus | `tests/fixtures/incident_evidence/invalid/*.json` |
 | Legacy timeline projection | `unifi_core.event_timeline.normalized_event_from_record` |
+| Client view (bounded projection) | `packages/unifi-core/src/unifi_core/incident_evidence_view.py` |
+| Client view JSON Schema artifact | `tests/fixtures/incident_evidence/incident-evidence-view.v1.schema.json` |
+| Golden client views | `tests/fixtures/incident_evidence/views/*.json` |
+| Bounded client views (adversarial documents, every page) | `tests/fixtures/incident_evidence/view-bounds/*.json` |
 
 Normalizers are pure: no controller I/O, no app imports. Collection (calling
 managers, enforcing budgets) belongs to the caller.
@@ -71,6 +75,15 @@ are derived and validated, never trusted from the producer.
   continuation flag (`has_more: false`) or remote total proves the tail was
   read; a cap never does, and neither does a total below the rows already
   read. `population_total` is set only when coverage is complete.
+- **Retention.** Each source's `retention_coverage` says whether the
+  controller still held every event of the queried window. It is always
+  `unknown`: neither product reports its oldest retained event, so an `empty`
+  source means the controller returned no event for the window, not that none
+  occurred before the controller discarded it. Network's `/stat/sysinfo`
+  `data_retention_*` settings describe statistics scales, and Protect's
+  `recordingRetentionDurationMs` and per-camera `recordingStart` describe
+  video; how either bounds the event log is not verified, so neither is used
+  to place a window inside or outside retention. Any all-clear must say so.
 - **Failure.** Sources end `complete`, `empty`, `partial` (with sorted
   reasons), or one of `unavailable`, `auth_failed`, `permission_denied`,
   `timeout`, `unsupported`, `parse_failed`, `not_attempted`. A response that
@@ -107,7 +120,7 @@ evidence = normalize_network_page(page, context)
 
 | Manager page | Exhaustion proof | Queried window |
 |--------------|------------------|----------------|
-| Network `get_events_page` (v2) | the last page of `total_page_count`, remote `total_element_count`, or an empty/short page when no page count is reported | submitted `timestampFrom`/`timestampTo` |
+| Network `get_events_page` and `read_events_page` (v2) | the last page of `total_page_count`, remote `total_element_count`, or an empty/short page when no page count is reported | submitted `timestampFrom`/`timestampTo` |
 | Network `get_events_page` (legacy) | fewer rows than the `_limit` sent (at most 3000) | `[collected_at - within_hours, request_started_at]` floored to ms |
 | Network `get_alarms_page` (v2) | a `total_page_count` of 1, remote total, or a short page of at most 100 when no page count is reported | submitted 30-day bounds |
 | Network `get_alarms_page` (legacy) | the full alarm list is the total | caller-supplied, else unknown |
@@ -123,6 +136,129 @@ status text only; controller text never leaves the manager.
 Tool responses (`normalize_*_tool_response`) carry no continuation state, so
 their sources are never complete. The relay and worker can report what tools
 returned but cannot present an all-clear until tools expose page state.
+
+## Client view
+
+A full document carries every record with its raw attributes and repeated
+provenance; at default budgets it can exceed 2 MB, more than MCP clients accept
+in one tool result. `client_view(evidence, max_records_returned=..., resume_after=...)`
+projects a validated document into a `unifi-incident-evidence-view` (version 1,
+schema artifact above). It is pure and deterministic and keeps no state between
+calls.
+
+| Field | Content |
+|-------|---------|
+| `requested_window`, `overall`, `coverage_complete`, `budgets`, `mappings` | Copied unchanged. |
+| `sources[]` | Each source's `source_id`, `product`, `source_tool`, `scope`, `outcome`, `failure`, `partial_reasons` and whole `coverage`, unchanged apart from cut labels, and `truncated`. API family, endpoint, query and collection time stay in the full document. |
+| `records[]` | Citations: `evidence_id`, `conflict_group` (versions only, see below), `product`, `source_tool`, `source_record_id`, `time` (`status`, `utc`, `boundary_uncertain` and the original field, type and value), `event_type`, `summary`, `entity_ids`, `mapping` (`status`, `target_ids`, assertion `sources`), and `truncated`. Raw attributes are dropped. |
+| `record_selection` | `max_records_returned`; `omission: "presentation_limit"`; `resume_after`; `collected`, `before_resume`, `returned` and `omitted` tallies (`total`, `in_window`, `out_of_window`, `untimed`); `too_large`; `limited_by`; `next_cursor`. |
+
+**Size.** A view takes at most 20,000 estimated tokens as an MCP tool result
+(`{"success": true, "data": <view>}`), well under the roughly 25,000 tokens
+clients accept. `estimated_tokens` costs the JSON an MCP server sends (indented
+by two spaces, non-ASCII text unescaped, quotes, backslashes and control
+characters escaped):
+- Every string value costs one token per UTF-8 byte it is sent in. No token
+  of a byte-level tokenizer is shorter than a byte, so no text costs fewer
+  estimated tokens than it really uses, however degenerate: a long
+  whitespace run, repeated punctuation, letters in no word, multi-byte or
+  emoji characters. Ordinary text costs about four times what it uses.
+- Field names (the view's own and the snake_case filter names a source
+  records), numbers and `true`, `false` and `null` cost what they are:
+  letters in a name one token per four, digits in a name one per three, a
+  number one per digit plus three, every other character its bytes. JSON's
+  indentation, quotes, colons and commas cost six tokens per member and
+  two per item.
+
+The view's serialized UTF-8 size is also capped at 80,000 bytes, four per
+budget token (`serialized_bytes`, `VIEW_BYTE_LIMIT`). Tokenizers average about
+four bytes a token over ordinary text, and a view the estimate fits is far
+smaller, since every string byte is a token of its own; only an estimate that
+undercounted some text could pass the cap. It is a backstop, not the bound:
+such a view is refused, with an error naming the limit and how to read less
+(`max_records_returned`, or `detail=full`), rather than sent. The cap bounds
+bytes, not tokens; the estimate bounds tokens. The token bound holds for any
+valid document, not only for what valid requests collect:
+- Overall status, coverage, failures, outcomes, reasons and assertions are
+  never dropped or cut. A failure is a kind and an HTTP status, never
+  controller or exception text.
+- A source's labels (`source_tool` and the scope's `controller_id`, `site`
+  and `location_id`) are cut to their first 128 estimated tokens (128 bytes),
+  and the source's `truncated` names each cut label with its full length in
+  characters (`{}` when nothing was cut). An ASCII label the request rules
+  accept is never cut; one with multi-byte characters is cut past 128 bytes
+  (a label of 128 emoji to its first 32), and a document from elsewhere, such
+  as an older relay's, can carry a longer one.
+- Request validation bounds the rest (at most 5 cameras, 20 assertions, and
+  a bounded label and identifier length and character set), so only
+  records are fitted to what remains.
+- A document whose sources and assertions alone, labels cut, would exceed the
+  budget has no honest view: every surface refuses it with an error that
+  states the source and assertion counts and how to narrow the request
+  (`detail=full` still returns the document). Valid requests never reach it.
+
+**Free text and identifiers.** `summary` is cut to its first 200 estimated
+tokens (200 bytes), `event_type` and a string `time.original_value` to 40, and
+`source_tool` to 128, as in its source. Long whitespace runs and other
+degenerate text are cut like any long text. The cut
+text is a prefix of the original, and the record's `truncated` names each cut
+field with its full length in characters; it is `{}` when nothing was cut.
+Identifiers (`evidence_id`, `source_record_id`, `entity_ids`, `target_ids`)
+are never cut. A record whose citation would take more than 2,500 estimated
+tokens, or whose evidence ID is longer than 256 characters, is never returned:
+it is counted in `too_large`, and only the full document shows it.
+
+**Conflict groups.** A record that is one of several differing versions of
+one identity (a `|version|<digest>` evidence ID) carries its `conflict_group`
+exactly as in the full document; every other record omits the key, never
+stating `null`. Records sharing a group are versions of one event, never
+distinct events, whether the identity is a source record ID or a summary-free
+`fields` hash. The group is the evidence ID without its suffix, so it is
+always shorter than the cited ID: it is costed inside the citation's
+2,500-token limit and the view's budget like any other identifier, never cut,
+and ordinary citations cost nothing more. Members of one group can fall on
+different pages; the source's `counts.conflicting` and its
+`conflicting_records` reason say how many versions exist. The schema requires
+the key exactly on versions; that it equals the evidence ID's own base is a
+semantic check consumers must run.
+
+**Selection.** Records are examined in selection order: in-window records
+earliest first, then untimed records, then out-of-window records, records at
+one time ordered by evidence ID. They are returned until `max_records_returned`
+records are returned or the next one would exceed the budget; a record that
+would exceed it even as the view's first is counted in `too_large`, like one
+over the citation limit. `limited_by` says which limit stopped the view, and
+is null when every record was examined. Returned records keep the document's
+order. Omission is a presentation limit: coverage, counts and outcomes still
+describe every collected record.
+
+**Continuation.** `next_cursor` is set exactly when a limit stopped the view.
+It names the last returned record's selection key,
+`<rank>|<utc>|<evidence_id>` (rank `0` in-window, `1` untimed with an empty
+time, `2` out-of-window). Repeat the same request with `resume_after` set to it
+to read the records after it; `before_resume` counts the records at or before
+the cursor. Records that share a timestamp are ordered by evidence ID, so every
+continuation returns new records: paging through a document returns each
+record once, or counts it once as `too_large`. A cursor names a position, not a
+snapshot: an event the controller added before that position since the last
+read is counted in `before_resume` and not shown. `max_records_returned`
+defaults to 25 and is at most 50; narrowing the window or filtering to exact
+device MACs or cameras also reduces what is omitted.
+
+Every view of every golden case, and every page of adversarial documents
+collected through the SDK decoders at each input bound (escaped,
+whitespace, punctuation, multi-byte and emoji characters, often in long
+runs, in every controller string; maximal labels and assertions; records
+sharing a timestamp; oversized identifiers), stays within the budget and the
+byte cap, measured on the bytes an MCP server sends rather than by the
+estimate itself, and states the same
+overall status, budgets, mappings, outcomes, failures, reasons and coverage as
+its document. So does every view of those documents with labels, assertions
+and sources beyond request validation added, or it is refused
+(`packages/unifi-core/tests/test_incident_evidence_view.py` and
+`test_incident_evidence_view_bounds.py`). `tests/fixtures/incident_evidence/view-bounds/`
+holds such documents with every page of their views, or the refusal, for
+other consumers.
 
 ## Current product contracts
 
@@ -270,14 +406,17 @@ above.
 
 ## Changing the contract
 
-The schema artifact and golden expected outputs are generated and drift-tested
-by `packages/unifi-core/tests/test_incident_evidence_golden.py`. After an
+The schema artifacts, golden expected outputs and golden views are generated
+and drift-tested by `packages/unifi-core/tests/test_incident_evidence_golden.py`,
+`test_incident_evidence_view.py` and `test_incident_evidence_view_bounds.py`. After an
 intentional change, bump `INCIDENT_EVIDENCE_SCHEMA_VERSION` if serialized
 output changes incompatibly, then regenerate and review the diff:
 
 ```bash
 INCIDENT_EVIDENCE_UPDATE_GOLDEN=1 uv run --package unifi-core pytest \
-  packages/unifi-core/tests/test_incident_evidence_golden.py
+  packages/unifi-core/tests/test_incident_evidence_golden.py \
+  packages/unifi-core/tests/test_incident_evidence_view.py \
+  packages/unifi-core/tests/test_incident_evidence_view_bounds.py
 ```
 
 Corpus fixtures use only synthetic identifiers: locally administered MACs,
