@@ -95,7 +95,8 @@ In Claude Code:
 ```
 
 Replace `unifi-network` with `unifi-protect` or `unifi-access` as needed.
-`/plugin install` opens the plugin's options dialog straight away. Fill it in
+`/plugin install` of a product plugin opens its options dialog straight away
+(plugins installed as dependencies open none; run their setup skills). Fill it in
 there, or press Esc and run the setup skill, which asks for each setting and
 never needs a password or API key typed into the chat. From a shell,
 `claude plugin install` instead reports the options as not yet set and suggests
@@ -172,6 +173,30 @@ that is already open keeps the unconfigured server until a new session starts or
 `openclaw gateway restart` runs. Repeat only for other UniFi products the user
 selected.
 
+### UniFi Intelligence
+
+`unifi-intelligence` is a skills-only plugin: Incident Investigation, Security
+Patrol and Visitor Audit. It ships no MCP server and requires the
+`unifi-network` and `unifi-protect` plugins, each set up with its own setup
+skill.
+
+- **Claude Code** installs both as dependencies:
+  `/plugin install unifi-intelligence@unifi-plugins`. It opens no options
+  dialog for them, so run the setup skill of each one not yet configured.
+  Network and Protect plugins you already installed are kept as they are.
+  `claude plugin prune` later removes only the plugins it installed as
+  dependencies, once no installed plugin still needs them.
+- **Codex and OpenClaw** install no plugin dependencies. Install and set up
+  `unifi-network` and `unifi-protect` first, then install `unifi-intelligence`
+  the same way.
+
+Incident Investigation uses the local Network and Protect servers. Security
+Patrol and Visitor Audit need the cloud worker: they call
+`unifi_location_timeline`, which only the
+[cloud worker](../apps/worker/) provides, through a connected
+[relay](../packages/unifi-mcp-relay/). Without it they stop with no tool
+call and say so; they may offer local reads, and make none until you agree.
+
 ## Standalone skills through npm
 
 The open [skills CLI](https://skills.sh/docs/cli) runs through `npx`; UniFi MCP
@@ -182,7 +207,7 @@ does not discover contributor-only skills from the repository root:
 npx skills add https://github.com/sirkirby/unifi-mcp/tree/main/plugins/unifi-network
 npx skills add https://github.com/sirkirby/unifi-mcp/tree/main/plugins/unifi-protect
 npx skills add https://github.com/sirkirby/unifi-mcp/tree/main/plugins/unifi-access
-npx skills add https://github.com/sirkirby/unifi-mcp/tree/main/plugins/cross-product
+npx skills add https://github.com/sirkirby/unifi-mcp/tree/main/plugins/unifi-intelligence
 ```
 
 Choose only the relevant command. The installer prompts for the destination
