@@ -12,7 +12,8 @@ Usage:
     python scripts/generate_skill_references.py [--check] [--root PATH]
 
 Flags:
-    --check   Dry-run mode: report drift without modifying files (exit 1 if drift found)
+    --check   Dry-run mode: report drift without modifying files (exit 1 if drift
+              is found or a tool category has no marker section)
 
 Markers in reference files:
     <!-- AUTO:tools:CATEGORY_NAME -->
@@ -163,14 +164,13 @@ def update_reference_content(content: str, categories: dict[str, list[dict]]) ->
                 merged_tools.extend(categories[cat])
                 matched_cats.add(cat)
 
-        if not merged_tools:
-            continue
-
-        # Sort merged: reads first, then mutates, alphabetical within
-        merged_tools.sort(key=lambda t: (0 if t["type"] == "Read" else 1, t["name"]))
-
-        table = generate_table(merged_tools)
-        replacement = f"{start_marker}\n{table}\n{end_marker}"
+        if merged_tools:
+            # Sort merged: reads first, then mutates, alphabetical within
+            merged_tools.sort(key=lambda t: (0 if t["type"] == "Read" else 1, t["name"]))
+            replacement = f"{start_marker}\n{generate_table(merged_tools)}\n{end_marker}"
+        else:
+            # The pinned release has no tools here (yet): an empty section, never stale rows.
+            replacement = f"{start_marker}\n{end_marker}"
 
         new_content, count = pattern.subn(replacement, content)
         if count > 0:
@@ -255,6 +255,11 @@ def run(root: Path, check_mode: bool) -> int:
 
     if check_mode and has_drift:
         print("\nDrift detected! Run without --check to update.")
+        return 1
+
+    if check_mode and total_missing:
+        # Tools in a category without a marker section never reach the reference.
+        print("\nAdd a marker section for each category above, then run without --check.")
         return 1
 
     return 0

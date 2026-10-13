@@ -15,13 +15,17 @@ none of them define their own evidence semantics.
 | Golden corpus | `tests/fixtures/incident_evidence/cases/*.json` |
 | Invalid corpus | `tests/fixtures/incident_evidence/invalid/*.json` |
 | Legacy timeline projection | `unifi_core.event_timeline.normalized_event_from_record` |
+| Bounded collection and combining | `packages/unifi-core/src/unifi_core/incident_collection.py` |
+| Network and Protect collectors | `unifi_core/network/incident_collection.py`, `unifi_core/protect/incident_collection.py` |
+| Collection request models | `unifi_core/network/models/incident_evidence.py`, `unifi_core/protect/models/incident_evidence.py` |
+| Mocked controller answers for collection | `tests/fixtures/incident_evidence/collection/controller_responses.json` |
 | Client view (bounded projection) | `packages/unifi-core/src/unifi_core/incident_evidence_view.py` |
 | Client view JSON Schema artifact | `tests/fixtures/incident_evidence/incident-evidence-view.v1.schema.json` |
 | Golden client views | `tests/fixtures/incident_evidence/views/*.json` |
 | Bounded client views (adversarial documents, every page) | `tests/fixtures/incident_evidence/view-bounds/*.json` |
 
-Normalizers are pure: no controller I/O, no app imports. Collection (calling
-managers, enforcing budgets) belongs to the caller.
+Normalizers are pure: no controller I/O, no app imports. The collectors call
+manager page reads and enforce budgets (see [Collecting evidence](#collecting-evidence)).
 
 ## Shape
 
@@ -126,6 +130,8 @@ evidence = normalize_network_page(page, context)
 | Network `get_alarms_page` (legacy) | the full alarm list is the total | caller-supplied, else unknown |
 | Protect `list_events_page` | fewer raw rows than `limit` (the NVR reports no totals), on the raw path (`camera_id` or `metadata_fields`) only; the SDK path filters after the limit and never proves the end | submitted `start`/`end`, unknown if either is omitted |
 | Protect `list_smart_detections_page` | fewer raw rows than `limit`, before confidence filtering, on the raw path only | as above |
+| Protect `list_events_raw_page` | fewer raw rows than `limit` | submitted `start`/`end` |
+| Network `read_events_page` | as `get_events_page`, from one request | v2: the absolute `timestampFrom`/`timestampTo` sent (`window_ms`), else as `get_events_page` |
 
 The list methods (`get_events`, `get_alarms`, `list_events`,
 `list_smart_detections`) return the same rows for tools and raise
@@ -134,10 +140,137 @@ row. Network manager failures carry fixed operation, exception class and HTTP
 status text only; controller text never leaves the manager.
 
 Tool responses (`normalize_*_tool_response`) carry no continuation state, so
-their sources are never complete. The relay and worker can report what tools
-returned but cannot present an all-clear until tools expose page state.
+their sources are never complete. The list tools' responses cannot support an
+all-clear; the incident evidence tools return complete evidence documents.
 
-## Client view
+## Collecting evidence
+
+`collect_network_incident_evidence(event_manager, request, site=...)` and
+`collect_protect_incident_evidence(event_manager, request)` take one window,
+optional exact identifiers and budgets, and return a validated
+`IncidentEvidence`. They never raise for a source failure; failures, budget
+exhaustion and truncation are in the document. MCP tools and API routes are
+thin adapters over them.
+
+### Inputs
+
+`NetworkIncidentRequest` and `ProtectIncidentRequest` validate every input
+before any read:
+
+| Field | Meaning |
+|-------|---------|
+| `start`, `end` | ISO 8601 with an explicit UTC offset; a bound without one is rejected as ambiguous. `start < end`. |
+| `device_macs` (Network) | Exact MACs, compared in canonical form. Names are rejected, never resolved. |
+| `camera_ids` (Protect) | Exact camera IDs (letters, digits, `.`, `_`, `:`, `-`), never trimmed or case-folded. At most 5: each camera is its own source, and every source is returned in full. |
+| `location_id` | The caller's label for the investigated location, recorded in each source's `scope`: 1 to 128 characters, none of them a control character, quote or backslash. |
+| `max_window_seconds` | Default 86400, at most 2592000. |
+| `max_events` | Default 1000, at most 10000. |
+| `max_calls` | Default 20, at most 100. |
+| `max_elapsed_ms` | Default 30000, at most 120000. |
+| `mappings` | Optional explicit `MappingAssertion`s, at most 20; records are resolved against them by exact identifier. Each `id` is 1 to 64 characters with no control character, quote or backslash, and an assertion states no `role`. |
+
+Validation messages name the field and reason, never the rejected value.
+The Network `site`, which comes from server configuration or the API route
+rather than the request, follows the `location_id` rule:
+`collect_network_incident_evidence` refuses one that breaks it before any read.
+Every label and assertion is repeated in the [client view](#client-view), so
+these bounds, with the camera and assertion counts, keep every valid
+request's view within its size budget; identifiers are refused, never cut.
+
+### Budgets
+
+Budgets are checked before every read; a read never asks for more rows than
+the events budget has left, and a read still running when the elapsed budget
+runs out is cancelled. The first spent budget stops collection.
+
+| Budget | Counts | When spent |
+|--------|--------|------------|
+| `window` | the requested window's duration | nothing is read; every source is `not_attempted` with failure `budget_exhausted` |
+| `events` | every row a request returned, including out-of-window rows and rows an exact-identifier filter later removed | reading stops |
+| `calls` | every HTTP request a read sends: the page request, the Network API-version probe, and every retry (uiprotect's status and reconnect retries, the retry after a re-login, aiohttp's own). Logins are not charged, and neither is connecting: each connection manager connects in its shared connect attempt, a task of its own, which a read only waits for within the `elapsed` budget. A request the budget cannot pay for is refused before it is sent | reading stops |
+| `elapsed` | wall time across reads, including connecting and, in the API, acquiring the manager | the running read is cancelled; usage is reported at the limit |
+
+A read's charge applies only in its own task. Persistent background tasks
+(the shared connect attempt, the Protect bootstrap refresh, the Network
+websocket, API event listeners) start with no charge, and any task a read
+happens to start inherits a charge it cannot use, so a read never throttles
+them and they never draw on it.
+
+A spent budget appears three ways: its kind in `budgets.exhausted`; the source
+it stopped is `partial` with `budget_exhausted` among its `partial_reasons`
+and `pagination.interrupted: true` (or `not_attempted` if it returned
+nothing); every later source is `not_attempted`. Truncation the stop caused
+stays visible as `truncated` or `truncation_unknown`. Overall is then
+`partial` or `failed`, never `complete` or `empty`.
+
+### Sources
+
+| Product | Sources | Read | Window | Filters recorded |
+|---------|---------|------|--------|------------------|
+| Network | `network.events` | `EventManager.read_events_page`, one request per page of up to 100 rows by page number | v2: the requested window as absolute millisecond bounds, widened by one boundary millisecond (below); legacy: a lookback long enough to reach `start` from any read within the elapsed budget. The queried window is what was submitted (the part every read covered) | v2: the categories and severities the controller applied; `device_macs` |
+| Protect | `protect.events`, or `protect.events.camera.NN` per camera in ID order | `EventManager.list_events_raw_page`, 100 rows per read by offset, newest first | the exact window in whole milliseconds | `camera_id` |
+
+Reading a source stops when the source proves its end (`has_more: false`, a
+short page, or its remote total reached), when a read fails, or when a budget
+is spent. Only a source read in a single request can be complete. Neither
+product offers a snapshot or cursor, so across several offset reads an event
+inserted or removed between reads shifts later offsets and a row can be
+skipped while totals stay equal (Protect reports none). A source read in more
+than one request is therefore `partial` with `truncation_unknown`, decided
+before any exact-identifier filter that could hide the movement. A short last
+read keeps every offset a whole number of pages and never asks for more rows
+than the events budget has left.
+
+On the v2 path the event log is asked for the window itself, so a quiet window
+on a busy controller can be read in one page and be complete. The query
+records `timestamp_from_ms`/`timestamp_to_ms` in place of `within_hours`.
+Whether the controller treats `timestampFrom` and `timestampTo` as inclusive
+or exclusive has not been verified against a live controller, so the bounds
+are widened, never narrowed: `timestampFrom` is the window start floored to
+milliseconds minus 1 ms, and `timestampTo` is the window end rounded up to
+milliseconds. Under any reading the controller then returns all of
+`[start, end)`; an event it returns at a widened edge is placed by its own
+timestamp and reported out-of-window. Subtracting a millisecond from the end
+instead would lose the window's last millisecond while still claiming it was
+covered. The legacy path only takes a lookback relative to now, so its rows
+newer than the window are read, counted against the events budget and
+reported out-of-window.
+`device_macs` keeps rows naming one of the MACs in any role; rows the filter
+cannot read stay in and count as malformed. The filtered page says
+`post_filtered`, so only the source's own end proof can make it complete.
+Network alarms are not collected in this slice.
+
+`list_events_raw_page` is one GET to the NVR `events` endpoint with explicit
+bounds, limit and offset. It does not use the SDK's `get_events`, which pages
+without bound when given a start time and drops event types it does not know,
+and it does no camera-name or Known Face lookups. NVR failures become
+fixed-text errors that keep the class and HTTP status, so `401` is
+`auth_failed` and `403` is `permission_denied`.
+
+### Read-only by construction
+
+Collectors receive the product `EventManager` and call only the methods in
+each collector module's `READ_METHODS` (`read_events_page`,
+`list_events_raw_page`). Tests run collection through a view that exposes only
+those methods, and through the real SDK decoders with the HTTP exchange
+replaced, asserting every request: Protect sends only GET; Network sends only
+the read-query POSTs its event API requires (`/system-log/count`,
+`/system-log/all`, `/stat/event`).
+
+### Combining evidence sets
+
+`combine_incident_evidence(documents)` merges evidence sets for the same
+requested window, for example one per product, into one validated set. It is
+pure and order-independent, and the same set passed twice counts once. Every
+source keeps its own outcome, failure, reasons and coverage; a source ID that
+two sets describe differently is an error. Mapping assertions are the union of
+every set's assertions and every record is resolved again against them.
+Budget limits and usage are summed, except `window_seconds`, which is the
+smallest limit. `exhausted` is the union of every set's exhausted kinds, so
+combining never hides exhaustion, even when the summed usage stays below the
+summed limit.
+
+### Client view
 
 A full document carries every record with its raw attributes and repeated
 provenance; at default budgets it can exceed 2 MB, more than MCP clients accept
@@ -190,7 +323,7 @@ valid document, not only for what valid requests collect:
   (a label of 128 emoji to its first 32), and a document from elsewhere, such
   as an older relay's, can carry a longer one.
 - Request validation bounds the rest (at most 5 cameras, 20 assertions, and
-  a bounded label and identifier length and character set), so only
+  the label and identifier rules under [Inputs](#inputs)), so only
   records are fitted to what remains.
 - A document whose sources and assertions alone, labels cut, would exceed the
   budget has no honest view: every surface refuses it with an error that
@@ -206,7 +339,7 @@ field with its full length in characters; it is `{}` when nothing was cut.
 Identifiers (`evidence_id`, `source_record_id`, `entity_ids`, `target_ids`)
 are never cut. A record whose citation would take more than 2,500 estimated
 tokens, or whose evidence ID is longer than 256 characters, is never returned:
-it is counted in `too_large`, and only the full document shows it.
+it is counted in `too_large`, and only `detail=full` shows it.
 
 **Conflict groups.** A record that is one of several differing versions of
 one identity (a `|version|<digest>` evidence ID) carries its `conflict_group`
@@ -259,6 +392,71 @@ and sources beyond request validation added, or it is refused
 `test_incident_evidence_view_bounds.py`). `tests/fixtures/incident_evidence/view-bounds/`
 holds such documents with every page of their views, or the refusal, for
 other consumers.
+
+### Surfaces
+
+| Surface | Network | Protect |
+|---------|---------|---------|
+| MCP tool (`readOnlyHint: true`) | `unifi_get_incident_evidence` | `protect_get_incident_evidence` |
+| REST (`GET`, read scope) | `/v1/sites/{site_id}/incident-evidence/network` | `/v1/sites/{site_id}/incident-evidence/protect` |
+| GraphQL (read permission) | `network { incidentEvidence(...) { document } }` | `protect { incidentEvidence(...) { document } }` |
+
+Tool arguments, REST query parameters and GraphQL arguments are the request
+fields above (`mappings` is a JSON-encoded string in REST and a JSON value in
+GraphQL), plus three presentation arguments, validated with the request before
+any read:
+
+| Argument | Meaning |
+|----------|---------|
+| `detail` | `view` (default) returns the [client view](#client-view); `full` returns the whole evidence document, for programmatic consumers. |
+| `max_records_returned` | Record citations in the view, 1 to 50, default 25. Rejected with `detail=full`. |
+| `resume_after` | A view's `record_selection.next_cursor`; the view of the same request then returns the records after it (see [continuation](#client-view)). Rejected with `detail=full`. |
+
+The MCP tools wait for the server's controller connection like every domain
+tool, within the same bound. A call made while the controller is still
+connecting, unreachable or rejecting the login returns that standard
+connection error, reads nothing and counts against no budget.
+
+Every surface renders through `EvidencePresentation.render`, so the same input
+and controller answers give the same payload. MCP returns
+`{"success": true, "data": <view or evidence>}`; REST returns
+`{"data": <view or evidence>, "render_hint": ...}`; GraphQL returns it as the
+JSON `document` field, because the JSON Schema artifacts, not the GraphQL
+schema, are the contract. Invalid input is an MCP error response, REST 422 or
+GraphQL `BAD_REQUEST`, naming declared fields and list indexes only (an
+undeclared key is never echoed). The Network site, recorded in each source's
+scope, follows the `location_id` rule: the API checks its `site_id`, and the
+MCP tool refuses a configured site (`UNIFI_NETWORK_SITE`) that breaks the
+rule before any read, saying how to fix it. Evidence too broad for its view
+(see [Size](#client-view)) is refused the same way, as an MCP error response,
+REST 422 or GraphQL `BAD_REQUEST` stating the source and assertion counts;
+`detail=full` still returns it. Framework argument coercion errors drop the
+rejected value too, and expected client errors are logged as one fixed line,
+without a traceback or the query source. GraphQL classifies errors by
+exception type, never by message text. A controller that does not run the
+product is refused before collection on both surfaces: REST 409
+`capability_mismatch`, GraphQL `CAPABILITY_MISMATCH`. The API validates input
+and checks the window budget before acquiring a manager, acquires it inside
+the first read so waiting for it is charged to the elapsed budget, reports an
+acquisition failure as a classified source failure (a refused login or
+bootstrap is `auth_failed` or `permission_denied` with its status; connection
+managers log only the operation and exception class), and never starts a background event
+listener for collection: it reuses an existing event manager or builds an
+uncached one. The evidence is identical for the
+same input and controller answers: the contract's key rules exclude every
+secret-like name, so egress redaction has nothing to remove. A source failure
+is still a successful response; check `overall` and `coverage_complete`.
+
+### Read-only clients in lazy mode
+
+The default lazy registration mode lists only meta-tools, and its route to a
+domain tool, `*_execute`, is not read-only, so a client that permits only
+`readOnlyHint: true` tools could reach no controller read. Each app's
+`LAZY_DIRECT_TOOLS` (in `categories.py`) names read-only tools that lazy mode
+registers directly at startup, so they are listed with their own annotations.
+Loading a module registers every tool in it, so startup fails unless every
+tool the module registers is named and read-only. `meta_only` mode still lists
+only meta-tools, and eager mode lists every tool.
 
 ## Current product contracts
 
@@ -392,8 +590,9 @@ point unless stated otherwise.
     source record ID as a string or empty, evidence ID).
 12. **Budgets.** `window` is exhausted exactly when `limits.window_seconds` is
     less than the requested window's duration. For events, calls and elapsed
-    time, usage above the limit must be reported exhausted and a reported
-    exhaustion needs usage at or above the limit. `exhausted` is sorted and
+    time, usage above the limit must be reported exhausted. A kind may be
+    reported exhausted below its limit: a combined set sums limits and usage
+    and keeps every kind any one collection spent. `exhausted` is sorted and
     unique.
 13. **Overall.** Recompute rule 5's outcomes and the overall status as
     described under Shape; `coverage_complete` is true exactly for `complete`
@@ -437,8 +636,9 @@ importing Python, and must reject every case under `invalid/`.
 projects timed evidence onto that legacy shape and returns `None` for untimed
 records. A projected list drops coverage and failure state, so callers that
 return it must also return the evidence set's source outcomes. The relay
-location timeline and the worker timeline still use the legacy path; moving
-them onto this contract means calling the current tool names and arguments
-above, reading each tool's record path, reporting per-source outcomes instead
-of skipping failed sources, and exposing page state before claiming
-completeness.
+location timeline and the worker timeline still use the legacy path. Moving
+them onto this contract means calling `unifi_get_incident_evidence` and
+`protect_get_incident_evidence` for one window, combining the documents with
+`combine_incident_evidence` (or, in TypeScript, the rules under
+[Combining evidence sets](#combining-evidence-sets)), and reporting per-source
+outcomes instead of skipping failed sources.
