@@ -1,4 +1,4 @@
-"""Validate shipped workflows against product manifests and relay registration.
+"""Validate shipped workflows against product manifests and the worker's timeline definition.
 
 Call examples use Python-style keyword arguments or batch operation dictionaries.
 Payload fields are distinct from top-level tool parameters. Prose parameter names
@@ -27,6 +27,7 @@ TOOL = r"(?:unifi|protect|access)_[a-z][a-z0-9_]+"
 # These are event/response field names, not tools (including in generated prose).
 DATA_NAMES = {"access_denied", "access_granted", "access_end", "access_denial"}
 SERVERS = {"network", "protect", "access", "relay"}
+TIMELINE_TOOL = "apps/worker/worker/src/location-timeline-tool.json"
 
 
 def catalog(*, pinned: bool = True) -> dict[str, tuple[str, dict]]:
@@ -41,20 +42,9 @@ def catalog(*, pinned: bool = True) -> dict[str, tuple[str, dict]]:
         )
         for tool in manifest["tools"]:
             result[tool["name"]] = (product, tool["schema"]["input"])
-    # Read the literal registration schema without importing controller code.
-    path = ROOT / "packages/unifi-mcp-relay/src/unifi_mcp_relay/location_timeline.py"
-    tree = ast.parse(path.read_text())
-    schema = next(
-        ast.literal_eval(node.value)
-        for node in tree.body
-        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "TOOL_INPUT_SCHEMA"
-    )
-    name = next(
-        ast.literal_eval(node.value)
-        for node in tree.body
-        if isinstance(node, ast.Assign) and any(getattr(target, "id", None) == "TOOL_NAME" for target in node.targets)
-    )
-    result[name] = ("relay", schema)
+    # The cloud worker serves this definition; skills reach it through a connected relay.
+    timeline = json.loads((ROOT / TIMELINE_TOOL).read_text(encoding="utf-8"))
+    result[timeline["name"]] = ("relay", timeline["inputSchema"])
     return result
 
 
@@ -203,7 +193,14 @@ def test_incomplete_report_examples_are_present(scenario: str) -> None:
 
 def test_documented_timeline_signature() -> None:
     text = (ROOT / "docs/cross-product.md").read_text()
-    assert not reference_errors(text, catalog(pinned=False))
+    tools = catalog(pinned=False)
+    assert not reference_errors(text, tools)
+    accepted = tools["unifi_location_timeline"][1]["properties"].keys()
+    section = text.split("## The Location Timeline Tool\n", 1)[1].split("\n## ", 1)[0]
+    parameters = section.split("Parameters:\n", 1)[1].split("\n\n", 1)[0]
+    assert accepted <= set(re.findall(r"`([a-z_]+)`", parameters)), "undocumented timeline parameters"
+    example = json.loads(section.split("```json\n", 1)[1].split("```", 1)[0])
+    assert example.keys() <= accepted
 
 
 @pytest.mark.parametrize("heading", ["Requirements", "Prerequisites", "Required MCP Server"])
