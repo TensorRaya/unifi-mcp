@@ -69,6 +69,15 @@ async def test_sdk_wrapped_logs_envelope_is_a_valid_empty_collection() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sdk_decoded_bare_empty_list_from_the_critical_log_is_no_alarms() -> None:
+    """The body Network 10.6 sends from /system-log/critical when nothing is critical, decoded by the SDK."""
+    page = await sdk_event_manager([]).get_alarms_page(limit=10)
+    assert page.rows == [] and page.has_more is False and page.total_reported == 0
+    with pytest.raises(UniFiMalformedResponseError):
+        await sdk_event_manager([]).get_events_page(limit=10)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("body", [{"unexpected": PRIVATE}, {"data": PRIVATE}, {"logs": {"x": PRIVATE}}, [VALID]])
 async def test_sdk_wrapped_unreadable_envelopes_raise_fixed_text(body) -> None:
     manager = sdk_event_manager(body)

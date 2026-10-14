@@ -26,12 +26,17 @@ def _manager(use_v2: bool, response) -> EventManager:
         (True, [{"data": [], "total_element_count": 0}]),
         (True, [{"logs": [], "total_page_count": 0}]),
         (True, [{"total_element_count": 0, "total_page_count": 0}]),
+        (True, []),
         (False, []),
         (False, {"data": []}),
     ],
 )
 async def test_valid_empty_collections_are_empty(use_v2, response) -> None:
     manager = _manager(use_v2, response)
+    if use_v2 and response == []:
+        # Only /system-log/critical answers an empty result this way (see below); events keep raising.
+        assert await manager.get_alarms(limit=10) == []
+        return
     assert await manager.get_events(limit=10) == []
     assert await manager.get_alarms(limit=10) == []
 
@@ -42,7 +47,6 @@ async def test_valid_empty_collections_are_empty(use_v2, response) -> None:
     [
         (True, {"unexpected": "envelope"}),
         (True, [{"unexpected": "envelope"}]),
-        (True, []),
         (True, [{"data": []}, {"data": []}]),
         (True, [{"total_element_count": 3}]),
         (True, {"data": "invalid"}),
@@ -71,3 +75,20 @@ async def test_malformed_later_v2_page_raises() -> None:
     manager._connection.request.side_effect = [{"data": [{"id": f"e{i}"} for i in range(100)]}, {"oops": 1}]
     with pytest.raises(UniFiMalformedResponseError):
         await manager.get_events(limit=150)
+
+
+@pytest.mark.asyncio
+async def test_bare_empty_list_is_no_alarms_but_still_malformed_for_events() -> None:
+    """Network 10.6 answers POST /system-log/critical with HTTP 200 and a bare ``[]`` when nothing is
+    critical, for every request body, while /system-log/all answers the same window with a full
+    envelope. ``[]`` is the empty alarm list there, nothing else; any non-empty bare list stays
+    malformed, and so does a bare ``[]`` from the events view."""
+    manager = _manager(True, [])
+    assert await manager.get_alarms(limit=10) == []
+    page = await manager.get_alarms_page(limit=10)
+    assert page.rows == [] and page.has_more is False and page.total_reported == 0
+    with pytest.raises(UniFiMalformedResponseError):
+        await manager.get_events(limit=10)
+    for bare_rows in ([{"id": "a1"}], [[]]):
+        with pytest.raises(UniFiMalformedResponseError):
+            await _manager(True, bare_rows).get_alarms(limit=10)

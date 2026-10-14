@@ -1013,6 +1013,10 @@ class EventManager:
             )
             response = await self._connection.request(api_request)
 
+            # Network 10.6 answers this view with a bare [] when nothing is critical (any body);
+            # /system-log/all answers the same window with an envelope. Here [] is the empty result.
+            if response == []:
+                response = {"data": [], "total_element_count": 0, "total_page_count": 0}
             page = _v2_page(response, "/system-log/critical")
             returned = page.rows[: max(limit, 0)]
             cut = len(page.rows) > len(returned)
